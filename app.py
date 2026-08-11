@@ -12,7 +12,8 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -33,30 +34,59 @@ def get_list_slug_name(url: str) -> str:
 
 
 def fetch_page_film_links(base_url: str, page_num: int):
-    """Fetch one page of the list and return list of (title, film_page_url)."""
+    """Fetch one page of the list and return (films, debug_info).
+
+    films is a list of (title, film_page_url). debug_info is a dict with
+    status_code and how many candidate elements were found, to help
+    diagnose scraping failures.
+    """
     url = base_url.rstrip("/") + f"/page/{page_num}/"
     resp = requests.get(url, headers=HEADERS, timeout=20)
+    debug_info = {"url": url, "status_code": resp.status_code, "candidates": 0}
+
     if resp.status_code != 200:
-        return []
+        return [], debug_info
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    containers = soup.select("li.poster-container div.film-poster")
-    if not containers:
-        containers = soup.select("li.poster-container div[data-target-link]")
+
+    # Letterboxd markup has varied over time; try several selector strategies.
+    candidates = soup.select("li.poster-container div.film-poster")
+    if not candidates:
+        candidates = soup.select("li.posteritem div.film-poster")
+    if not candidates:
+        candidates = soup.select("div.film-poster")
+    if not candidates:
+        candidates = soup.select("[data-film-slug]")
+
+    debug_info["candidates"] = len(candidates)
 
     films = []
-    for c in containers:
-        title = c.get("data-film-name") or c.get("data-item-name")
+    seen_slugs = set()
+    for c in candidates:
+        title = (
+            c.get("data-film-name")
+            or c.get("data-item-name")
+            or c.get("alt")
+        )
         target_link = c.get("data-target-link")
+        slug = c.get("data-film-slug") or c.get("data-item-slug")
+
         img = c.find("img")
         if not title and img:
             title = img.get("alt")
 
-        if title and target_link:
+        film_url = None
+        if target_link:
             film_url = "https://letterboxd.com" + target_link
-            films.append((title, film_url))
+        elif slug:
+            film_url = f"https://letterboxd.com/film/{slug}/"
 
-    return films
+        if title and film_url and slug not in seen_slugs:
+            films.append((title, film_url))
+            if slug:
+                seen_slugs.add(slug)
+
+    return films, debug_info
 
 
 def get_poster_from_film_page(film_url: str):
@@ -122,10 +152,12 @@ if start:
 
         all_films = []
         page_num = int(start_page)
+        debug_log = []
 
         while page_num <= int(end_page):
             status.info(f"Scanning page {page_num}...")
-            films = fetch_page_film_links(list_url, page_num)
+            films, debug_info = fetch_page_film_links(list_url, page_num)
+            debug_log.append(debug_info)
             if not films:
                 break
             all_films.extend(films)
@@ -136,6 +168,15 @@ if start:
                 "No films found in that page range. Double check the list "
                 "URL and page numbers are correct."
             )
+            with st.expander("Debug info"):
+                for d in debug_log:
+                    st.write(d)
+                st.write(
+                    "If status_code is not 200, Letterboxd may be blocking "
+                    "requests from this server. If status_code is 200 but "
+                    "candidates is 0, Letterboxd's page markup may have "
+                    "changed and the scraper's selectors need updating."
+                )
         else:
             status.info(f"Found {len(all_films)} films. Fetching posters from each movie page...")
 
