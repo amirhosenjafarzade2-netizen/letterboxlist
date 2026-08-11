@@ -1,6 +1,8 @@
 import io
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import requests
 import streamlit as st
@@ -15,6 +17,17 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+MAX_WORKERS = 16
+
+
+def make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def sanitize_filename(name: str) -> str:
@@ -33,7 +46,7 @@ def get_list_slug_name(url: str) -> str:
     return "list"
 
 
-def fetch_page_film_links(base_url: str, page_num: int):
+def fetch_page_film_links(session: requests.Session, base_url: str, page_num: int):
     """Fetch one page of the list and return (films, debug_info).
 
     films is a list of (title, film_page_url). debug_info is a dict with
@@ -41,7 +54,7 @@ def fetch_page_film_links(base_url: str, page_num: int):
     diagnose scraping failures.
     """
     url = base_url.rstrip("/") + f"/page/{page_num}/"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = session.get(url, timeout=20)
     debug_info = {"url": url, "status_code": resp.status_code, "candidates": 0}
 
     if resp.status_code != 200:
@@ -113,10 +126,10 @@ def fetch_page_film_links(base_url: str, page_num: int):
     return films, debug_info
 
 
-def get_poster_from_film_page(film_url: str):
+def get_poster_from_film_page(session: requests.Session, film_url: str):
     """Visit the movie's own page and pull the real poster from the og:image meta tag."""
     try:
-        resp = requests.get(film_url, headers=HEADERS, timeout=20)
+        resp = session.get(film_url, timeout=20)
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -128,8 +141,8 @@ def get_poster_from_film_page(film_url: str):
     return None
 
 
-def download_image(url: str) -> bytes:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+def download_image(session: requests.Session, url: str) -> bytes:
+    resp = session.get(url, timeout=20)
     resp.raise_for_status()
     return resp.content
 
@@ -137,6 +150,16 @@ def download_image(url: str) -> bytes:
 def get_extension(url: str) -> str:
     match = re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", url.lower())
     return match.group(1) if match else "jpg"
+
+
+def fetch_poster_bytes(session: requests.Session, title: str, film_url: str):
+    """Worker used by the thread pool: resolve a film's poster and download it."""
+    poster_url = get_poster_from_film_page(session, film_url)
+    if not poster_url:
+        return title, None, None
+    img_bytes = download_image(session, poster_url)
+    ext = get_extension(poster_url)
+    return title, img_bytes, ext
 
 
 st.title("🎬 Letterboxd List Poster Downloader")
@@ -173,19 +196,34 @@ if start:
         list_name = get_list_slug_name(list_url)
         status = st.empty()
         progress = st.progress(0)
+        session = make_session()
+
+        # Scan list pages concurrently.
+        page_range = list(range(int(start_page), int(end_page) + 1))
+        status.info(f"Scanning {len(page_range)} page(s)...")
+
+        page_results = {}
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(page_range))) as executor:
+            futures = {
+                executor.submit(fetch_page_film_links, session, list_url, p): p
+                for p in page_range
+            }
+            for future in as_completed(futures):
+                p = futures[future]
+                films, debug_info = future.result()
+                page_results[p] = (films, debug_info)
 
         all_films = []
-        page_num = int(start_page)
         debug_log = []
-
-        while page_num <= int(end_page):
-            status.info(f"Scanning page {page_num}...")
-            films, debug_info = fetch_page_film_links(list_url, page_num)
+        for p in page_range:
+            films, debug_info = page_results[p]
             debug_log.append(debug_info)
             if not films:
+                # Stop including pages once we hit an empty one, mirroring
+                # the old "stop at end of list" behavior, but only for
+                # pages at/after the first empty one encountered in order.
                 break
             all_films.extend(films)
-            page_num += 1
 
         if not all_films:
             status.error(
@@ -215,35 +253,39 @@ if start:
             used_names = {}
             folder_name = sanitize_filename(f"letterboxd {list_name}")
             success_count = 0
+            done_count = 0
+            progress_lock = Lock()
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i, (title, film_url) in enumerate(all_films):
-                    try:
-                        poster_url = get_poster_from_film_page(film_url)
-                        if not poster_url:
-                            st.warning(f"Could not find a poster for '{title}'.")
-                            progress.progress((i + 1) / len(all_films))
-                            continue
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {
+                        executor.submit(fetch_poster_bytes, session, title, film_url): title
+                        for title, film_url in all_films
+                    }
+                    for future in as_completed(futures):
+                        title = futures[future]
+                        try:
+                            title, img_bytes, ext = future.result()
+                            if img_bytes is None:
+                                st.warning(f"Could not find a poster for '{title}'.")
+                            else:
+                                base_name = sanitize_filename(title)
+                                # avoid collisions from duplicate titles
+                                count = used_names.get(base_name, 0)
+                                used_names[base_name] = count + 1
+                                filename = (
+                                    f"{base_name}.{ext}"
+                                    if count == 0
+                                    else f"{base_name} ({count}).{ext}"
+                                )
+                                zf.writestr(f"{folder_name}/{filename}", img_bytes)
+                                success_count += 1
+                        except Exception as e:
+                            st.warning(f"Could not download poster for '{title}': {e}")
 
-                        img_bytes = download_image(poster_url)
-                        ext = get_extension(poster_url)
-                        base_name = sanitize_filename(title)
-
-                        # avoid collisions from duplicate titles
-                        count = used_names.get(base_name, 0)
-                        used_names[base_name] = count + 1
-                        filename = (
-                            f"{base_name}.{ext}"
-                            if count == 0
-                            else f"{base_name} ({count}).{ext}"
-                        )
-
-                        zf.writestr(f"{folder_name}/{filename}", img_bytes)
-                        success_count += 1
-                    except Exception as e:
-                        st.warning(f"Could not download poster for '{title}': {e}")
-
-                    progress.progress((i + 1) / len(all_films))
+                        with progress_lock:
+                            done_count += 1
+                            progress.progress(done_count / len(all_films))
 
             zip_buffer.seek(0)
             zip_filename = f"letterboxd {list_name}.zip"
