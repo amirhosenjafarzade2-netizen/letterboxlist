@@ -23,7 +23,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def get_list_slug_name(url: str) -> str:
-    """Try to derive a nice name for the zip file from the list URL."""
+    """Try to derive a nice name for the zip file / folder from the list URL."""
     parts = [p for p in url.rstrip("/").split("/") if p]
     if "list" in parts:
         idx = parts.index("list")
@@ -32,62 +32,43 @@ def get_list_slug_name(url: str) -> str:
     return "list"
 
 
-def get_poster_url_from_img(img_tag) -> str:
-    """Letterboxd lazy-loads posters; check common attributes."""
-    for attr in ("data-src", "srcset", "src"):
-        val = img_tag.get(attr)
-        if val:
-            # srcset may contain multiple urls, take the first
-            first = val.split(",")[0].strip().split(" ")[0]
-            if first.startswith("http"):
-                return first
-    return None
-
-
-def fetch_page_films(base_url: str, page_num: int):
-    """Fetch one page of the list and return list of (title, poster_url)."""
+def fetch_page_film_links(base_url: str, page_num: int):
+    """Fetch one page of the list and return list of (title, film_page_url)."""
     url = base_url.rstrip("/") + f"/page/{page_num}/"
     resp = requests.get(url, headers=HEADERS, timeout=20)
     if resp.status_code != 200:
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    containers = soup.select("li.poster-container div.film-poster, li.poster-container div[data-film-name]")
+    containers = soup.select("li.poster-container div.film-poster")
     if not containers:
-        containers = soup.select("div.film-poster")
+        containers = soup.select("li.poster-container div[data-target-link]")
 
     films = []
     for c in containers:
         title = c.get("data-film-name") or c.get("data-item-name")
+        target_link = c.get("data-target-link")
         img = c.find("img")
         if not title and img:
             title = img.get("alt")
-        poster_url = get_poster_url_from_img(img) if img else None
 
-        # Letterboxd often serves a real poster only via an ajax endpoint
-        # referenced in data-target-link; fall back to that if no direct image found.
-        if not poster_url:
-            target_link = c.get("data-target-link") or c.get("data-film-slug")
-            if target_link:
-                poster_url = try_ajax_poster(target_link)
-
-        if title and poster_url:
-            films.append((title, poster_url))
+        if title and target_link:
+            film_url = "https://letterboxd.com" + target_link
+            films.append((title, film_url))
 
     return films
 
 
-def try_ajax_poster(target_link: str):
-    """Fallback: query Letterboxd's ajax poster endpoint for a larger image."""
+def get_poster_from_film_page(film_url: str):
+    """Visit the movie's own page and pull the real poster from the og:image meta tag."""
     try:
-        slug = target_link.strip("/").split("/")[-1] if "film" in target_link else target_link
-        ajax_url = f"https://letterboxd.com/ajax/poster{target_link}std/230x345/"
-        resp = requests.get(ajax_url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            img = soup.find("img")
-            if img and img.get("src"):
-                return img["src"]
+        resp = requests.get(film_url, headers=HEADERS, timeout=20)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        meta = soup.find("meta", property="og:image")
+        if meta and meta.get("content"):
+            return meta["content"]
     except Exception:
         pass
     return None
@@ -106,9 +87,9 @@ def get_extension(url: str) -> str:
 
 st.title("🎬 Letterboxd List Poster Downloader")
 st.write(
-    "Paste a link to a Letterboxd list. This app will go through every page of "
-    "the list, grab each movie's poster thumbnail, and package them all into a "
-    "zip file you can download."
+    "Paste a link to a Letterboxd list. This app will go through the list "
+    "pages you choose, visit each movie's own page to grab its real poster, "
+    "and package them all into a zip file you can download."
 )
 
 list_url = st.text_input(
@@ -116,23 +97,35 @@ list_url = st.text_input(
     placeholder="https://letterboxd.com/username/list/list-name/",
 )
 
+col1, col2 = st.columns(2)
+with col1:
+    start_page = st.number_input("From page", min_value=1, value=1, step=1)
+with col2:
+    end_page = st.number_input("To page", min_value=1, value=1, step=1)
+
+st.caption(
+    "Not sure how many pages the list has? Set 'To page' high — the app "
+    "stops automatically once it hits a page with no films."
+)
+
 start = st.button("Fetch posters", type="primary", disabled=not list_url)
 
 if start:
     if "letterboxd.com" not in list_url or "/list/" not in list_url:
         st.error("That doesn't look like a valid Letterboxd list URL.")
+    elif end_page < start_page:
+        st.error("'To page' must be greater than or equal to 'From page'.")
     else:
         list_name = get_list_slug_name(list_url)
         status = st.empty()
         progress = st.progress(0)
 
         all_films = []
-        page_num = 1
-        max_pages = 200  # safety cap
+        page_num = int(start_page)
 
-        while page_num <= max_pages:
+        while page_num <= int(end_page):
             status.info(f"Scanning page {page_num}...")
-            films = fetch_page_films(list_url, page_num)
+            films = fetch_page_film_links(list_url, page_num)
             if not films:
                 break
             all_films.extend(films)
@@ -140,18 +133,26 @@ if start:
 
         if not all_films:
             status.error(
-                "No films/posters found. Double check the list URL is correct "
-                "and public."
+                "No films found in that page range. Double check the list "
+                "URL and page numbers are correct."
             )
         else:
-            status.info(f"Found {len(all_films)} films. Downloading posters...")
+            status.info(f"Found {len(all_films)} films. Fetching posters from each movie page...")
 
             zip_buffer = io.BytesIO()
             used_names = {}
+            folder_name = sanitize_filename(f"letterboxd {list_name}")
+            success_count = 0
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i, (title, poster_url) in enumerate(all_films):
+                for i, (title, film_url) in enumerate(all_films):
                     try:
+                        poster_url = get_poster_from_film_page(film_url)
+                        if not poster_url:
+                            st.warning(f"Could not find a poster for '{title}'.")
+                            progress.progress((i + 1) / len(all_films))
+                            continue
+
                         img_bytes = download_image(poster_url)
                         ext = get_extension(poster_url)
                         base_name = sanitize_filename(title)
@@ -165,7 +166,8 @@ if start:
                             else f"{base_name} ({count}).{ext}"
                         )
 
-                        zf.writestr(filename, img_bytes)
+                        zf.writestr(f"{folder_name}/{filename}", img_bytes)
+                        success_count += 1
                     except Exception as e:
                         st.warning(f"Could not download poster for '{title}': {e}")
 
@@ -174,7 +176,7 @@ if start:
             zip_buffer.seek(0)
             zip_filename = f"letterboxd {list_name}.zip"
 
-            status.success(f"Done! {len(all_films)} posters packaged into your zip file.")
+            status.success(f"Done! {success_count} of {len(all_films)} posters packaged into your zip file.")
             st.download_button(
                 label="⬇️ Download zip",
                 data=zip_buffer,
