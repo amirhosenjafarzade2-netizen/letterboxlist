@@ -59,32 +59,50 @@ def fetch_page_film_links(base_url: str, page_num: int):
         candidates = soup.select("[data-film-slug]")
 
     debug_info["candidates"] = len(candidates)
+    debug_info["sample_html"] = str(candidates[0])[:800] if candidates else None
 
     films = []
-    seen_slugs = set()
+    seen_urls = set()
     for c in candidates:
+        # Title: prefer explicit data attributes, fall back to the poster image's alt text.
         title = (
             c.get("data-film-name")
             or c.get("data-item-name")
             or c.get("alt")
         )
-        target_link = c.get("data-target-link")
-        slug = c.get("data-film-slug") or c.get("data-item-slug")
-
         img = c.find("img")
         if not title and img:
-            title = img.get("alt")
+            title = img.get("alt") or img.get("data-original-alt")
+
+        # Film URL: prefer explicit data attributes, fall back to any <a href="/film/.../">
+        # either on the element itself, its children, or its parent <li>.
+        target_link = c.get("data-target-link")
+        slug = c.get("data-film-slug") or c.get("data-item-slug")
 
         film_url = None
         if target_link:
             film_url = "https://letterboxd.com" + target_link
         elif slug:
             film_url = f"https://letterboxd.com/film/{slug}/"
+        else:
+            a_tag = c.find("a", href=re.compile(r"^/film/"))
+            if not a_tag:
+                parent_li = c.find_parent("li")
+                if parent_li:
+                    a_tag = parent_li.find("a", href=re.compile(r"^/film/"))
+            if not a_tag:
+                # the poster div might itself be wrapped by an <a>
+                a_parent = c.find_parent("a", href=re.compile(r"^/film/"))
+                if a_parent:
+                    a_tag = a_parent
+            if a_tag and a_tag.get("href"):
+                film_url = "https://letterboxd.com" + a_tag["href"]
+                if not title:
+                    title = a_tag.get("title") or a_tag.get_text(strip=True)
 
-        if title and film_url and slug not in seen_slugs:
-            films.append((title, film_url))
-            if slug:
-                seen_slugs.add(slug)
+        if title and film_url and film_url not in seen_urls:
+            films.append((title.strip(), film_url))
+            seen_urls.add(film_url)
 
     return films, debug_info
 
@@ -170,12 +188,15 @@ if start:
             )
             with st.expander("Debug info"):
                 for d in debug_log:
-                    st.write(d)
+                    st.write(f"Page: {d['url']} — status {d['status_code']} — {d['candidates']} candidates")
+                    if d.get("sample_html"):
+                        st.code(d["sample_html"], language="html")
                 st.write(
                     "If status_code is not 200, Letterboxd may be blocking "
-                    "requests from this server. If status_code is 200 but "
-                    "candidates is 0, Letterboxd's page markup may have "
-                    "changed and the scraper's selectors need updating."
+                    "requests from this server. If candidates is 0, the "
+                    "selectors found no poster elements at all. If "
+                    "candidates > 0 but no films were extracted, check the "
+                    "sample HTML above for the actual attribute/tag names."
                 )
         else:
             status.info(f"Found {len(all_films)} films. Fetching posters from each movie page...")
