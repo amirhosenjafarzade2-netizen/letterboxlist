@@ -59,7 +59,14 @@ def fetch_page_film_links(base_url: str, page_num: int):
         candidates = soup.select("[data-film-slug]")
 
     debug_info["candidates"] = len(candidates)
-    debug_info["sample_html"] = str(candidates[0])[:800] if candidates else None
+    if candidates:
+        first = candidates[0]
+        parent_li = first.find_parent("li")
+        debug_info["sample_html"] = str(first)[:500]
+        debug_info["sample_parent_html"] = str(parent_li)[:1200] if parent_li else None
+    else:
+        debug_info["sample_html"] = None
+        debug_info["sample_parent_html"] = None
 
     films = []
     seen_urls = set()
@@ -74,31 +81,30 @@ def fetch_page_film_links(base_url: str, page_num: int):
         if not title and img:
             title = img.get("alt") or img.get("data-original-alt")
 
-        # Film URL: prefer explicit data attributes, fall back to any <a href="/film/.../">
-        # either on the element itself, its children, or its parent <li>.
-        target_link = c.get("data-target-link")
-        slug = c.get("data-film-slug") or c.get("data-item-slug")
-
+        # Film URL: check the element itself, then walk up through all ancestors
+        # looking for data attributes or an <a href="/film/.../">, since Letterboxd
+        # often puts the real data on the <li> wrapping the (lazy-loaded) poster div.
         film_url = None
-        if target_link:
-            film_url = "https://letterboxd.com" + target_link
-        elif slug:
-            film_url = f"https://letterboxd.com/film/{slug}/"
-        else:
-            a_tag = c.find("a", href=re.compile(r"^/film/"))
-            if not a_tag:
-                parent_li = c.find_parent("li")
-                if parent_li:
-                    a_tag = parent_li.find("a", href=re.compile(r"^/film/"))
-            if not a_tag:
-                # the poster div might itself be wrapped by an <a>
-                a_parent = c.find_parent("a", href=re.compile(r"^/film/"))
-                if a_parent:
-                    a_tag = a_parent
+
+        node = c
+        for _ in range(4):  # climb a few levels: div -> li -> ul, etc.
+            if node is None:
+                break
+            target_link = node.get("data-target-link")
+            slug = node.get("data-film-slug") or node.get("data-item-slug")
+            if target_link:
+                film_url = "https://letterboxd.com" + target_link
+                break
+            if slug:
+                film_url = f"https://letterboxd.com/film/{slug}/"
+                break
+            a_tag = node.find("a", href=re.compile(r"^/film/")) if hasattr(node, "find") else None
             if a_tag and a_tag.get("href"):
                 film_url = "https://letterboxd.com" + a_tag["href"]
                 if not title:
                     title = a_tag.get("title") or a_tag.get_text(strip=True)
+                break
+            node = node.find_parent()
 
         if title and film_url and film_url not in seen_urls:
             films.append((title.strip(), film_url))
@@ -190,7 +196,11 @@ if start:
                 for d in debug_log:
                     st.write(f"Page: {d['url']} — status {d['status_code']} — {d['candidates']} candidates")
                     if d.get("sample_html"):
+                        st.write("Poster element:")
                         st.code(d["sample_html"], language="html")
+                    if d.get("sample_parent_html"):
+                        st.write("Parent `<li>` element:")
+                        st.code(d["sample_parent_html"], language="html")
                 st.write(
                     "If status_code is not 200, Letterboxd may be blocking "
                     "requests from this server. If candidates is 0, the "
