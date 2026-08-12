@@ -127,17 +127,24 @@ def fetch_page_film_links(session: requests.Session, base_url: str, page_num: in
 
 
 def get_poster_and_year_from_film_page(session: requests.Session, film_url: str):
-    """Visit the movie's own page and pull the real poster (og:image) and release year."""
+    """Visit the movie's own page and pull the real poster (og:image) and release year.
+
+    Returns (poster_url, year, debug_info) where debug_info records what
+    happened, to help diagnose failures.
+    """
+    debug_info = {"film_url": film_url, "status_code": None, "og_image_found": False, "error": None}
     try:
         resp = session.get(film_url, timeout=20)
+        debug_info["status_code"] = resp.status_code
         if resp.status_code != 200:
-            return None, None
+            return None, None, debug_info
         soup = BeautifulSoup(resp.text, "html.parser")
 
         poster_url = None
         meta_img = soup.find("meta", property="og:image")
         if meta_img and meta_img.get("content"):
             poster_url = meta_img["content"]
+            debug_info["og_image_found"] = True
 
         year = None
         # Letterboxd usually links the release year like <a href="/films/year/2010/">
@@ -154,9 +161,10 @@ def get_poster_and_year_from_film_page(session: requests.Session, film_url: str)
                 if match:
                     year = match.group(1)
 
-        return poster_url, year
-    except Exception:
-        return None, None
+        return poster_url, year, debug_info
+    except Exception as e:
+        debug_info["error"] = str(e)
+        return None, None, debug_info
 
 
 def download_image(session: requests.Session, url: str) -> bytes:
@@ -172,12 +180,16 @@ def get_extension(url: str) -> str:
 
 def fetch_poster_bytes(session: requests.Session, title: str, film_url: str):
     """Worker used by the thread pool: resolve a film's poster + year and download it."""
-    poster_url, year = get_poster_and_year_from_film_page(session, film_url)
+    poster_url, year, debug_info = get_poster_and_year_from_film_page(session, film_url)
     if not poster_url:
-        return title, year, None, None
-    img_bytes = download_image(session, poster_url)
+        return title, year, None, None, debug_info
+    try:
+        img_bytes = download_image(session, poster_url)
+    except Exception as e:
+        debug_info["error"] = f"image download failed: {e}"
+        return title, year, None, None, debug_info
     ext = get_extension(poster_url)
-    return title, year, img_bytes, ext
+    return title, year, img_bytes, ext, debug_info
 
 
 st.title("🎬 Letterboxd List Poster Downloader")
@@ -273,6 +285,7 @@ if start:
             success_count = 0
             done_count = 0
             progress_lock = Lock()
+            poster_debug_log = []
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -283,12 +296,15 @@ if start:
                     for future in as_completed(futures):
                         title = futures[future]
                         try:
-                            title, img_bytes, ext = future.result()
+                            title, year, img_bytes, ext, debug_info = future.result()
+                            poster_debug_log.append(debug_info)
                             if img_bytes is None:
                                 st.warning(f"Could not find a poster for '{title}'.")
                             else:
-                                base_name = sanitize_filename(title)
-                                # avoid collisions from duplicate titles
+                                base_name = sanitize_filename(
+                                    f"{title} ({year})" if year else title
+                                )
+                                # avoid collisions from duplicate titles/years
                                 count = used_names.get(base_name, 0)
                                 used_names[base_name] = count + 1
                                 filename = (
@@ -304,6 +320,20 @@ if start:
                         with progress_lock:
                             done_count += 1
                             progress.progress(done_count / len(all_films))
+
+            if success_count == 0:
+                with st.expander("Debug info (poster downloads)"):
+                    for d in poster_debug_log[:10]:
+                        st.write(d)
+                    st.write(
+                        "status_code ≠ 200 → the film page itself couldn't be "
+                        "fetched (blocking/rate-limiting). status_code = 200 "
+                        "but og_image_found = False → Letterboxd's film page "
+                        "markup no longer exposes the poster via the "
+                        "og:image meta tag. 'error' with 'image download "
+                        "failed' → the poster URL was found but fetching "
+                        "the actual image file failed."
+                    )
 
             zip_buffer.seek(0)
             zip_filename = f"letterboxd {list_name}.zip"
