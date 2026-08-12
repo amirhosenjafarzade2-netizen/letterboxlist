@@ -126,19 +126,37 @@ def fetch_page_film_links(session: requests.Session, base_url: str, page_num: in
     return films, debug_info
 
 
-def get_poster_from_film_page(session: requests.Session, film_url: str):
-    """Visit the movie's own page and pull the real poster from the og:image meta tag."""
+def get_poster_and_year_from_film_page(session: requests.Session, film_url: str):
+    """Visit the movie's own page and pull the real poster (og:image) and release year."""
     try:
         resp = session.get(film_url, timeout=20)
         if resp.status_code != 200:
-            return None
+            return None, None
         soup = BeautifulSoup(resp.text, "html.parser")
-        meta = soup.find("meta", property="og:image")
-        if meta and meta.get("content"):
-            return meta["content"]
+
+        poster_url = None
+        meta_img = soup.find("meta", property="og:image")
+        if meta_img and meta_img.get("content"):
+            poster_url = meta_img["content"]
+
+        year = None
+        # Letterboxd usually links the release year like <a href="/films/year/2010/">
+        year_link = soup.find("a", href=re.compile(r"^/films/year/\d{4}/"))
+        if year_link:
+            match = re.search(r"/films/year/(\d{4})/", year_link["href"])
+            if match:
+                year = match.group(1)
+        if not year:
+            # Fall back to parsing "Title (YYYY)" out of the og:title meta tag.
+            meta_title = soup.find("meta", property="og:title")
+            if meta_title and meta_title.get("content"):
+                match = re.search(r"\((\d{4})\)", meta_title["content"])
+                if match:
+                    year = match.group(1)
+
+        return poster_url, year
     except Exception:
-        pass
-    return None
+        return None, None
 
 
 def download_image(session: requests.Session, url: str) -> bytes:
@@ -153,13 +171,13 @@ def get_extension(url: str) -> str:
 
 
 def fetch_poster_bytes(session: requests.Session, title: str, film_url: str):
-    """Worker used by the thread pool: resolve a film's poster and download it."""
-    poster_url = get_poster_from_film_page(session, film_url)
+    """Worker used by the thread pool: resolve a film's poster + year and download it."""
+    poster_url, year = get_poster_and_year_from_film_page(session, film_url)
     if not poster_url:
-        return title, None, None
+        return title, year, None, None
     img_bytes = download_image(session, poster_url)
     ext = get_extension(poster_url)
-    return title, img_bytes, ext
+    return title, year, img_bytes, ext
 
 
 st.title("🎬 Letterboxd List Poster Downloader")
